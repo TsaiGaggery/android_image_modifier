@@ -329,6 +329,41 @@ class SuperPartition:
                 elif ext.target_type == LPExtent.TARGET_ZERO:
                     fout.write(b'\x00' * ext.size_bytes)
 
+    def max_partition_size(self, part_name):
+        """Calculate the maximum size a partition can grow to.
+
+        For single-extent LINEAR partitions, this is the current extent size
+        plus any free space immediately following it (up to the next extent
+        or the end of the super partition).
+        """
+        meta = self.read_lp_metadata()
+        part = meta.find_partition(part_name)
+        if not part or part.num_extents == 0:
+            return 0
+
+        current_bytes = part.total_sectors(meta.extents) * SECTOR
+
+        # Only handle growth for single-extent LINEAR partitions
+        if part.num_extents != 1:
+            return current_bytes
+        ext = meta.extents[part.first_extent]
+        if ext.target_type != LPExtent.TARGET_LINEAR:
+            return current_bytes
+
+        ext_end_sector = ext.target_data + ext.num_sectors
+
+        # Find the nearest extent that starts after this one
+        next_start = self.super_size // SECTOR  # end of super partition
+        for i, other in enumerate(meta.extents):
+            if i == part.first_extent:
+                continue
+            if other.num_sectors == 0 or other.target_type != LPExtent.TARGET_LINEAR:
+                continue
+            if other.target_data >= ext_end_sector:
+                next_start = min(next_start, other.target_data)
+
+        return next_start * SECTOR - ext.target_data * SECTOR
+
     def write_partition_from_file(self, part_name, input_path):
         """Write a partition image back into the super partition and update metadata."""
         meta = self.read_lp_metadata()
@@ -345,11 +380,19 @@ class SuperPartition:
         old_total_sectors = part.total_sectors(meta.extents)
         old_total_bytes = old_total_sectors * SECTOR
 
+        # If new image is larger, try to grow the extent into free space
         if new_size > old_total_bytes:
-            raise ValueError(
-                f'New image ({new_size / 1024 / 1024:.1f} MB) exceeds '
-                f'partition space ({old_total_bytes / 1024 / 1024:.1f} MB). '
-                f'Try more aggressive compression or reduce content.')
+            max_size = self.max_partition_size(part_name)
+            if new_size > max_size:
+                raise ValueError(
+                    f'New image ({new_size / 1024 / 1024:.1f} MB) exceeds '
+                    f'available space ({max_size / 1024 / 1024:.1f} MB). '
+                    f'Try more aggressive compression or reduce content.')
+            # Grow the extent (single-extent case, validated by max_partition_size)
+            ext = meta.extents[part.first_extent]
+            ext.num_sectors = new_sectors
+            old_total_sectors = new_sectors
+            old_total_bytes = new_sectors * SECTOR
 
         with open(self.image_path, 'r+b') as fdisk, open(input_path, 'rb') as fin:
             written = 0
@@ -650,6 +693,7 @@ def do_repack(image_path, partition_name, source_dir, no_backup=False):
         sys.exit(1)
 
     old_total = part.total_sectors(meta.extents) * SECTOR
+    max_total = sp.max_partition_size(partition_name)
     mount_point = detect_mount_point(partition_name)
     base_name = partition_name.removesuffix('_a').removesuffix('_b')
 
@@ -692,10 +736,13 @@ def do_repack(image_path, partition_name, source_dir, no_backup=False):
             uuid=uuid)
 
         print(f'  New image: {new_size / 1024 / 1024:.1f} MB  '
-              f'(limit: {old_total / 1024 / 1024:.1f} MB)')
+              f'(limit: {max_total / 1024 / 1024:.1f} MB)')
 
-        if new_size > old_total:
-            print(f'Error: new image is {(new_size - old_total) / 1024 / 1024:.1f} MB too large!',
+        if new_size > old_total and new_size <= max_total:
+            growth = (new_size - old_total) / 1024 / 1024
+            print(f'  Growing partition by {growth:.1f} MB (free space available)')
+        elif new_size > max_total:
+            print(f'Error: new image is {(new_size - max_total) / 1024 / 1024:.1f} MB too large!',
                   file=sys.stderr)
             print(f'Try reducing content or using a different compression.', file=sys.stderr)
             sys.exit(1)
@@ -859,15 +906,20 @@ def cmd_update(args):
 
         overlay = os.path.abspath(args.overlay)
         file_count = 0
-        for root, dirs, files in os.walk(overlay):
-            rel = os.path.relpath(root, overlay)
-            target = os.path.join(dest_dir, rel) if rel != '.' else dest_dir
-            os.makedirs(target, exist_ok=True)
-            for fname in files:
-                src = os.path.join(root, fname)
-                dst = os.path.join(target, fname)
-                shutil.copy2(src, dst)
-                file_count += 1
+        if os.path.isfile(overlay):
+            dst = os.path.join(dest_dir, os.path.basename(overlay))
+            shutil.copy2(overlay, dst)
+            file_count = 1
+        else:
+            for root, dirs, files in os.walk(overlay):
+                rel = os.path.relpath(root, overlay)
+                target = os.path.join(dest_dir, rel) if rel != '.' else dest_dir
+                os.makedirs(target, exist_ok=True)
+                for fname in files:
+                    src = os.path.join(root, fname)
+                    dst = os.path.join(target, fname)
+                    shutil.copy2(src, dst)
+                    file_count += 1
         print(f'  Overlaid {file_count} files' +
               (f' into {args.dest}/' if args.dest else ''))
 
@@ -953,7 +1005,7 @@ def main():
     p = sub.add_parser('update', help='Add/update files in a partition')
     p.add_argument('image', help='Disk image file')
     p.add_argument('partition', help='Logical partition name (e.g., vendor_a)')
-    p.add_argument('overlay', help='Directory of files to add/overlay')
+    p.add_argument('overlay', help='File or directory to add/overlay')
     p.add_argument('--dest', help='Destination subdirectory within partition (e.g., firmware/)')
     p.add_argument('--no-backup', action='store_true', help='Skip automatic backup')
     p.set_defaults(func=cmd_update)
